@@ -3,8 +3,7 @@ import yfinance as yf
 from datetime import datetime, timedelta
 from scipy.interpolate import interp1d
 import numpy as np
-import os
-import requests
+import time
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Earnings Position Checker", page_icon="📈")
@@ -15,17 +14,17 @@ def filter_dates(dates):
     today = datetime.today().date()
     cutoff_date = today + timedelta(days=45)
     sorted_dates = sorted(datetime.strptime(date, "%Y-%m-%d").date() for date in dates)
+    sorted_dates = [date for date in sorted_dates if date > today]
 
-    arr = []
-    for i, date in enumerate(sorted_dates):
+    if not sorted_dates:
+        raise ValueError("No future option expiration dates found.")
+
+    first_date = sorted_dates[0]
+    for date in sorted_dates:
         if date >= cutoff_date:
-            arr = [d.strftime("%Y-%m-%d") for d in sorted_dates[:i+1]]  
-            break
-    
-    if len(arr) > 0:
-        if arr[0] == today.strftime("%Y-%m-%d"):
-            return arr[1:]
-        return arr
+            selected_dates = [first_date, date]
+            return [d.strftime("%Y-%m-%d") for d in dict.fromkeys(selected_dates)]
+
     raise ValueError("No date 45 days or more in the future found.")
 
 def yang_zhang(price_data, window=30, trading_periods=252, return_last_only=True):
@@ -59,166 +58,43 @@ def build_term_structure(days, ivs):
         else: return float(spline(dte))
     return term_spline
 
-def get_marketdata_token():
-    try:
-        token = st.secrets.get("MARKETDATA_TOKEN")
-    except Exception:
-        token = None
-    return token or os.getenv("MARKETDATA_TOKEN")
+def retry_yfinance_call(callable_obj, attempts=2, delay=2):
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            return callable_obj()
+        except Exception as error:
+            last_error = error
+            if "Too Many Requests" not in str(error) and "Rate limited" not in str(error):
+                raise
+            if attempt < attempts - 1:
+                time.sleep(delay)
+    raise last_error
 
-def marketdata_get(path, params=None):
-    token = get_marketdata_token()
-    if not token:
-        raise ValueError("Missing MARKETDATA_TOKEN.")
-
-    response = requests.get(
-        f"https://api.marketdata.app/v1/{path}",
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-        params=params or {},
-        timeout=30,
-    )
-    response.raise_for_status()
-    data = response.json()
-    if data.get("s") == "error":
-        raise ValueError(data.get("errmsg", "MarketData.app returned an error."))
-    if data.get("s") == "no_data":
-        raise ValueError("MarketData.app returned no data.")
-    return data
-
-def first_value(data, key):
-    values = data.get(key, [])
-    if isinstance(values, list) and values:
-        return values[0]
-    return None
-
-def option_rows(chain):
-    row_count = len(chain.get("optionSymbol", []))
-    rows = []
-    for i in range(row_count):
-        rows.append({key: values[i] for key, values in chain.items() if isinstance(values, list) and len(values) > i})
-    return rows
-
-def marketdata_price_history(ticker_symbol):
-    end_date = datetime.today().date()
-    start_date = end_date - timedelta(days=110)
-    data = marketdata_get(
-        f"stocks/candles/D/{ticker_symbol}/",
-        {"from": start_date.isoformat(), "to": end_date.isoformat()},
-    )
-
-    import pandas as pd
-    price_history = pd.DataFrame({
-        "Open": data.get("o", []),
-        "High": data.get("h", []),
-        "Low": data.get("l", []),
-        "Close": data.get("c", []),
-        "Volume": data.get("v", []),
-    })
-    return price_history.dropna()
-
-def compute_recommendation_marketdata(ticker_symbol):
-    ticker_symbol = ticker_symbol.strip().upper()
-    dte_targets = [7, 14, 30, 45]
-    atm_iv = {}
-    straddle = None
-    underlying_price = None
-
-    for dte_target in dte_targets:
-        chain = marketdata_get(
-            f"options/chain/{ticker_symbol}/",
-            {"dte": dte_target, "strikeLimit": 2, "weekly": "true", "monthly": "true"},
-        )
-        rows = option_rows(chain)
-        if not rows:
-            continue
-
-        underlying_price = underlying_price or rows[0].get("underlyingPrice")
-        expiration_ts = rows[0].get("expiration")
-        if expiration_ts is None:
-            continue
-
-        expiration_date = datetime.fromtimestamp(expiration_ts).date()
-        dte = max((expiration_date - datetime.today().date()).days, 0)
-        calls = [row for row in rows if row.get("side") == "call"]
-        puts = [row for row in rows if row.get("side") == "put"]
-        if not calls or not puts or underlying_price is None:
-            continue
-
-        call = min(calls, key=lambda row: abs(row.get("strike", 0) - underlying_price))
-        put = min(puts, key=lambda row: abs(row.get("strike", 0) - underlying_price))
-
-        if call.get("iv") is not None and put.get("iv") is not None:
-            atm_iv[dte] = (float(call["iv"]) + float(put["iv"])) / 2.0
-
-        if straddle is None:
-            call_mid = call.get("mid")
-            put_mid = put.get("mid")
-            if call_mid is None:
-                call_mid = (float(call.get("bid", 0)) + float(call.get("ask", 0))) / 2.0
-            if put_mid is None:
-                put_mid = (float(put.get("bid", 0)) + float(put.get("ask", 0))) / 2.0
-            straddle = float(call_mid) + float(put_mid)
-
-    if underlying_price is None:
-        quote = marketdata_get(f"stocks/quotes/{ticker_symbol}/")
-        underlying_price = first_value(quote, "last") or first_value(quote, "mid")
-
-    if not atm_iv or max(atm_iv.keys()) < 45:
-        return {"error": "Not enough option data from MarketData.app (need dates 45+ days out)."}
-    if underlying_price is None:
-        return {"error": "Could not retrieve current stock price."}
-
-    dtes = list(atm_iv.keys())
-    iv_vals = list(atm_iv.values())
-    term_spline = build_term_structure(dtes, iv_vals)
-    ts_slope = (term_spline(45) - term_spline(min(dtes))) / (45 - min(dtes))
-
-    price_history = marketdata_price_history(ticker_symbol)
-    if price_history.empty:
-        return {"error": "Could not retrieve price history."}
-
-    iv30_rv30 = term_spline(30) / yang_zhang(price_history)
-    avg_volume = price_history['Volume'].rolling(30).mean().iloc[-1]
-    expected_move = f"{round(straddle / underlying_price * 100, 2)}%" if straddle else "N/A"
-
-    return {
-        'raw_vol': avg_volume,
-        'raw_iv_rv': iv30_rv30,
-        'raw_slope': ts_slope,
-        'avg_volume': avg_volume >= 1500000,
-        'iv30_rv30': iv30_rv30 >= 1.25,
-        'ts_slope_0_45': ts_slope <= -0.00406,
-        'expected_move': expected_move,
-        'error': None
-    }
-
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def compute_recommendation(ticker_symbol):
-    if get_marketdata_token():
-        return compute_recommendation_marketdata(ticker_symbol)
-
     ticker_symbol = ticker_symbol.strip().upper()
     stock = yf.Ticker(ticker_symbol)
     
-    if not stock.options:
+    options = retry_yfinance_call(lambda: list(stock.options))
+    if not options:
         return {"error": f"No options found for '{ticker_symbol}'."}
     
     try:
-        exp_dates = filter_dates(list(stock.options))
+        exp_dates = filter_dates(options)
     except Exception:
         return {"error": "Not enough option data (need dates 45+ days out)."}
     
-    # Get current price
-    hist = stock.history(period='1d')
-    if hist.empty:
+    price_history = retry_yfinance_call(lambda: stock.history(period='3mo'))
+    if price_history.empty:
         return {"error": "Could not retrieve current stock price."}
-    underlying_price = hist['Close'].iloc[-1]
+    underlying_price = price_history['Close'].iloc[-1]
 
     atm_iv = {}
     straddle = None
     
     for i, exp_date in enumerate(exp_dates):
-        chain = stock.option_chain(exp_date)
+        chain = retry_yfinance_call(lambda exp_date=exp_date: stock.option_chain(exp_date))
         calls, puts = chain.calls, chain.puts
         if calls.empty or puts.empty: continue
 
@@ -244,8 +120,6 @@ def compute_recommendation(ticker_symbol):
     
     ts_slope = (term_spline(45) - term_spline(dtes[0])) / (45 - dtes[0])
     
-    # Volatility and Volume
-    price_history = stock.history(period='3mo')
     iv30_rv30 = term_spline(30) / yang_zhang(price_history)
     avg_volume = price_history['Volume'].rolling(30).mean().iloc[-1]
     expected_move = f"{round(straddle / underlying_price * 100, 2)}%" if straddle else "N/A"
